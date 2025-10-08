@@ -1,1 +1,327 @@
+<# Code by -Lakshmi T S
+.SYNOPSIS
+Enumerates all Power BI workspaces you can access and exports metadata to CSV:
+- Workspaces
+- Dashboards
+- Reports
+- Report pages (tabs)
+- Apps (optional)
+
+.DESCRIPTION
+- Installs/imports MicrosoftPowerBIMgmt modules as needed (CurrentUser scope).
+- Interactive sign-in (Connect-PowerBIServiceAccount).
+- Enumerates workspaces (Get-PowerBIWorkspace -All), dashboards, reports, and
+  report pages via REST. Optionally enumerates Apps if -IncludeApps is passed.
+- Builds five collections and prints formatted tables in the console.
+- Exports each collection to CSV files in the current directory.
+
+PRIVACY
+- Use -Sanitize to redact Display/Report/Workspace names, hash IDs, and drop URLs.
+  This is recommended if you plan to share example outputs publicly.
+
+.PARAMETER IncludeApps
+Include Apps enumeration. Requires Get-PowerBIApp (Admin module) and
+often admin privileges (Scope Organization). Disabled by default.
+
+.PARAMETER Sanitize
+Redacts names, hashes IDs, and removes URLs in outputs for safe sharing.
+
+.EXAMPLE
+# Simple run (no apps), real data:
+.\Export-PowerBI-Metadata.ps1
+
+.EXAMPLE
+# Include Apps (if you have rights) and sanitize outputs for sharing:
+.\Export-PowerBI-Metadata.ps1 -IncludeApps -Sanitize
+
+.OUTPUTS
+Creates CSVs in the current directory:
+- Workspaces.csv
+- Dashboards.csv
+- Reports.csv
+- ReportPages.csv
+- Apps.csv (only when -IncludeApps)
+
+.NOTES
+- Tested on PowerShell 5.1 and 7.x
+- Requires MicrosoftPowerBIMgmt modules
+- Avoid committing real CSVs to public repos; see README
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$IncludeApps,
+    [switch]$Sanitize
+)
+
+# --------------------------------------------
+# 0) Settings & helpers
+# --------------------------------------------
+$ErrorActionPreference = 'Stop'
+
+function Convert-ToSafeString {
+    param([string]$Value)
+    if (-not $Sanitize) { return $Value }
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    return '[REDACTED]'
+}
+
+function Hash-Id {
+    param([string]$Value)
+    if (-not $Sanitize) { return $Value }
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+    $sha   = [System.Security.Cryptography.SHA256]::Create()
+    $hash  = $sha.ComputeHash($bytes)
+    (($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0,12)
+}
+
+# --------------------------------------------
+# 1) Capture current date/time once
+# --------------------------------------------
+$retrievalTime = Get-Date
+
+# --------------------------------------------
+# 2) Import/install required Power BI modules
+#    - Only install Admin if -IncludeApps is used
+# --------------------------------------------
+Write-Host "Checking required modules..." -ForegroundColor Cyan
+
+# Core modules
+$requiredModules = @(
+    'MicrosoftPowerBIMgmt.Profile',
+    'MicrosoftPowerBIMgmt.Workspaces',
+    'MicrosoftPowerBIMgmt.Reports'
+)
+
+foreach ($m in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $m)) {
+        Write-Host "Installing $m under CurrentUser..." -ForegroundColor Cyan
+        Install-Module -Name $m -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
+    }
+    Import-Module $m -ErrorAction Stop
+}
+
+# Optional Admin for Apps
+$adminAvailable = $false
+if ($IncludeApps) {
+    if (-not (Get-Module -ListAvailable -Name MicrosoftPowerBIMgmt.Admin)) {
+        Write-Host "Installing MicrosoftPowerBIMgmt.Admin under CurrentUser..." -ForegroundColor Cyan
+        Install-Module -Name MicrosoftPowerBIMgmt.Admin -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
+    }
+    try {
+        Import-Module MicrosoftPowerBIMgmt.Admin -ErrorAction Stop
+        $adminAvailable = $true
+    }
+    catch {
+        Write-Warning "Could not import MicrosoftPowerBIMgmt.Admin; Apps enumeration will be skipped. Details: $_"
+    }
+}
+
+# --------------------------------------------
+# 3) Authenticate (interactive)
+# --------------------------------------------
+Write-Host "Signing in to Power BI..." -ForegroundColor Cyan
+Connect-PowerBIServiceAccount
+
+# --------------------------------------------
+# 4) Retrieve all workspaces you belong to
+# --------------------------------------------
+Write-Host "Fetching workspaces (Get-PowerBIWorkspace -All)..." -ForegroundColor Cyan
+$allWorkspaces = Get-PowerBIWorkspace -All
+
+if (-not $allWorkspaces) {
+    Write-Warning "No workspaces returned. Confirm your account has at least Viewer access."
+    return
+}
+
+# Prepare arrays to hold the output rows
+$workspaceOutput   = New-Object System.Collections.Generic.List[object]
+$dashboardOutput   = New-Object System.Collections.Generic.List[object]
+$reportOutput      = New-Object System.Collections.Generic.List[object]
+$reportPagesOutput = New-Object System.Collections.Generic.List[object]
+$appOutput         = New-Object System.Collections.Generic.List[object]
+
+# --------------------------------------------
+# 5) Loop through each workspace
+# --------------------------------------------
+foreach ($ws in $allWorkspaces) {
+
+    # 5.0) Collect basic workspace info
+    $workspaceOutput.Add([PSCustomObject]@{
+        WorkspaceName = (Convert-ToSafeString $ws.Name)
+        WorkspaceId   = (Hash-Id $ws.Id)
+        WorkspaceType = $ws.Type   # e.g. Workspace / PersonalGroup
+        RetrievedAt   = $retrievalTime
+    })
+
+    # 5.1) Dashboards
+    Write-Host "`n→ Enumerating dashboards in '$($ws.Name)'" -ForegroundColor Green
+    $dashboards = @()
+    try   { $dashboards = Get-PowerBIDashboard -WorkspaceId $ws.Id }
+    catch { Write-Warning "  Could not retrieve dashboards in '$($ws.Name)': $_" }
+
+    if (-not $dashboards -or $dashboards.Count -eq 0) {
+        Write-Host "  (No dashboards found)" -ForegroundColor Yellow
+    } else {
+        foreach ($dash in $dashboards) {
+            $dashboardOutput.Add([PSCustomObject]@{
+                WorkspaceName   = (Convert-ToSafeString $ws.Name)
+                WorkspaceId     = (Hash-Id $ws.Id)
+                DashboardName   = (Convert-ToSafeString $dash.DisplayName)
+                DashboardId     = (Hash-Id $dash.Id)
+                DashboardWebUrl = ($Sanitize ? $null : $dash.WebUrl)
+                RetrievedAt     = $retrievalTime
+            })
+            Write-Host "  • Dashboard: $($dash.DisplayName)" -ForegroundColor White
+        }
+    }
+
+    # 5.2) Reports
+    Write-Host "→ Enumerating reports in '$($ws.Name)'" -ForegroundColor Green
+    $reports = @()
+    try   { $reports = Get-PowerBIReport -WorkspaceId $ws.Id }
+    catch { Write-Warning "  Could not retrieve reports in '$($ws.Name)': $_" }
+
+    if (-not $reports -or $reports.Count -eq 0) {
+        Write-Host "  (No reports found)" -ForegroundColor Yellow
+    } else {
+        foreach ($rep in $reports) {
+            $reportOutput.Add([PSCustomObject]@{
+                WorkspaceName = (Convert-ToSafeString $ws.Name)
+                WorkspaceId   = (Hash-Id $ws.Id)
+                ReportName    = (Convert-ToSafeString $rep.Name)
+                ReportId      = (Hash-Id $rep.Id)
+                ReportWebUrl  = ($Sanitize ? $null : $rep.WebUrl)
+                RetrievedAt   = $retrievalTime
+            })
+            Write-Host "  • Report: $($rep.Name)" -ForegroundColor White
+
+            # 5.2.1) Report pages via REST
+            Write-Host "     ↳ Retrieving pages..." -ForegroundColor DarkCyan
+            $pages = @()
+            try {
+                $raw  = Invoke-PowerBIRestMethod -Url "groups/$($ws.Id)/reports/$($rep.Id)/pages" -Method Get
+                $json = $raw | ConvertFrom-Json
+                $pages = $json.value
+            }
+            catch {
+                Write-Warning "     Could not retrieve pages for '$($rep.Name)': $_"
+            }
+
+            if (-not $pages -or $pages.Count -eq 0) {
+                Write-Host "     (No pages found)" -ForegroundColor Yellow
+            } else {
+                foreach ($page in $pages) {
+                    $pageUrl = ($Sanitize ? $null : "$($rep.WebUrl)?pageName=$($page.name)")
+                    $reportPagesOutput.Add([PSCustomObject]@{
+                        WorkspaceName   = (Convert-ToSafeString $ws.Name)
+                        WorkspaceId     = (Hash-Id $ws.Id)
+                        ReportName      = (Convert-ToSafeString $rep.Name)
+                        ReportId        = (Hash-Id $rep.Id)
+                        PageDisplayName = (Convert-ToSafeString $page.displayName)
+                        PageName        = (Hash-Id $page.name)
+                        PageWebUrl      = $pageUrl
+                        RetrievedAt     = $retrievalTime
+                    })
+                    Write-Host "     • Page: $($page.displayName)" -ForegroundColor White
+                }
+            }
+        }
+    }
+
+    # 5.3) Apps (optional)
+    if ($IncludeApps -and $adminAvailable -and (Get-Command -Name Get-PowerBIApp -ErrorAction SilentlyContinue)) {
+        Write-Host "→ Enumerating apps in '$($ws.Name)'" -ForegroundColor DarkMagenta
+        $apps = @()
+        try {
+            # Organization scope is broad; filter by WorkspaceId
+            $apps = Get-PowerBIApp -Scope Organization | Where-Object { $_.WorkspaceId -eq $ws.Id }
+        }
+        catch {
+            Write-Warning "  Could not retrieve apps for '$($ws.Name)': $_"
+        }
+
+        if (-not $apps -or $apps.Count -eq 0) {
+            Write-Host "  (No apps found)" -ForegroundColor Yellow
+        } else {
+            foreach ($app in $apps) {
+                $appOutput.Add([PSCustomObject]@{
+                    WorkspaceName = (Convert-ToSafeString $ws.Name)
+                    WorkspaceId   = (Hash-Id $ws.Id)
+                    AppName       = (Convert-ToSafeString $app.Name)
+                    AppId         = (Hash-Id $app.Id)
+                    AppWebUrl     = ($Sanitize ? $null : $app.WebUrl)
+                    RetrievedAt   = $retrievalTime
+                })
+                Write-Host "  • App: $($app.Name)" -ForegroundColor White
+            }
+        }
+    } elseif ($IncludeApps -and -not $adminAvailable) {
+        Write-Host "  (Skipping Apps: Admin module unavailable)" -ForegroundColor DarkYellow
+    }
+}
+
+# --------------------------------------------
+# 6) Display summarized tables
+# --------------------------------------------
+Write-Host "`n===== WORKSPACES =====" -ForegroundColor Magenta
+$workspaceOutput | Select-Object WorkspaceName, WorkspaceId, WorkspaceType, RetrievedAt | Format-Table -AutoSize
+
+Write-Host "`n===== DASHBOARDS =====" -ForegroundColor Magenta
+if ($dashboardOutput.Count -eq 0) {
+    Write-Host "No dashboards found." -ForegroundColor Yellow
+} else {
+    $dashboardOutput | Select-Object WorkspaceName, DashboardName, DashboardId, DashboardWebUrl, RetrievedAt | Format-Table -AutoSize
+}
+
+Write-Host "`n===== REPORTS =====" -ForegroundColor Magenta
+if ($reportOutput.Count -eq 0) {
+    Write-Host "No reports found." -ForegroundColor Yellow
+} else {
+    $reportOutput | Select-Object WorkspaceName, ReportName, ReportId, ReportWebUrl, RetrievedAt | Format-Table -AutoSize
+}
+
+Write-Host "`n===== REPORT PAGES =====" -ForegroundColor Magenta
+if ($reportPagesOutput.Count -eq 0) {
+    Write-Host "No report pages found (or REST call skipped/failed)." -ForegroundColor Yellow
+} else {
+    $reportPagesOutput | Select-Object WorkspaceName, ReportName, PageDisplayName, PageName, PageWebUrl, RetrievedAt | Format-Table -AutoSize
+}
+
+if ($IncludeApps) {
+    Write-Host "`n===== APPS =====" -ForegroundColor Magenta
+    if ($appOutput.Count -eq 0) {
+        Write-Host "No apps found (or skipped)." -ForegroundColor Yellow
+    } else {
+        $appOutput | Select-Object WorkspaceName, AppName, AppId, AppWebUrl, RetrievedAt | Format-Table -AutoSize
+    }
+}
+
+# --------------------------------------------
+# 7) Export to CSV
+# --------------------------------------------
+$basePath = Get-Location
+$workspaceCsv   = Join-Path $basePath "Workspaces.csv"
+$dashboardCsv   = Join-Path $basePath "Dashboards.csv"
+$reportCsv      = Join-Path $basePath "Reports.csv"
+$reportPagesCsv = Join-Path $basePath "ReportPages.csv"
+$appCsv         = Join-Path $basePath "Apps.csv"
+
+$workspaceOutput   | Sort-Object WorkspaceName                    | Export-Csv -Path $workspaceCsv   -NoTypeInformation
+$dashboardOutput   | Sort-Object WorkspaceName, DashboardName     | Export-Csv -Path $dashboardCsv   -NoTypeInformation
+$reportOutput      | Sort-Object WorkspaceName, ReportName        | Export-Csv -Path $reportCsv      -NoTypeInformation
+$reportPagesOutput | Sort-Object WorkspaceName, ReportName, PageName | Export-Csv -Path $reportPagesCsv -NoTypeInformation
+if ($IncludeApps) {
+    $appOutput     | Sort-Object WorkspaceName, AppName           | Export-Csv -Path $appCsv         -NoTypeInformation
+}
+
+Write-Host "`n✔ Exported CSVs:" -ForegroundColor Green
+Write-Host "   • Workspaces   → $workspaceCsv"   -ForegroundColor White
+Write-Host "   • Dashboards   → $dashboardCsv"   -ForegroundColor White
+Write-Host "   • Reports      → $reportCsv"      -ForegroundColor White
+Write-Host "   • ReportPages  → $reportPagesCsv" -ForegroundColor White
+if ($IncludeApps) {
+    Write-Host "   • Apps         → $appCsv"         -ForegroundColor White
+}
 
